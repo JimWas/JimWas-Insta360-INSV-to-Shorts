@@ -21,25 +21,30 @@ def check_ffmpeg():
 
 
 def get_video_info(input_file):
-    """Get video duration and other metadata"""
+    """Get video duration and resolution"""
     try:
         cmd = [
             'ffprobe',
             '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
+            '-show_entries', 'format=duration:stream=width,height',
+            '-select_streams', 'v:0',
+            '-of', 'json',
             str(input_file)
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        duration = float(result.stdout.strip())
-        return duration
+        import json
+        data = json.loads(result.stdout)
+        duration = float(data['format']['duration'])
+        width = int(data['streams'][0]['width'])
+        height = int(data['streams'][0]['height'])
+        return duration, width, height
     except Exception as e:
         print(f"Error getting video info: {e}")
-        return None
+        return None, None, None
 
 
-def convert_insv_to_shorts(input_file, output_dir=None, max_duration=120, 
-                           quality='high', lens='front'):
+def convert_insv_to_shorts(input_file, output_dir=None, max_duration=120,
+                           quality='high', lens='front', yaw=0, fov=80):
     """
     Convert Insta360 .insv file to 9:16 vertical video(s)
     Automatically splits long videos into multiple segments
@@ -50,6 +55,8 @@ def convert_insv_to_shorts(input_file, output_dir=None, max_duration=120,
         max_duration: Maximum video duration per segment in seconds (default: 120)
         quality: Video quality - 'high', 'medium', 'low' (default: 'high')
         lens: Which lens to use - 'front' or 'back' (default: 'front')
+        yaw: Horizontal viewing angle -80 to 80 degrees (default: 0 = center)
+        fov: Horizontal field of view in degrees (default: 80). Lower = zoomed in, higher = wider
     
     Returns:
         Number of segments created (0 if failed)
@@ -67,11 +74,14 @@ def convert_insv_to_shorts(input_file, output_dir=None, max_duration=120,
     else:
         output_path = input_path.parent
     
-    # Get video duration
-    duration = get_video_info(input_file)
+    # Get video duration and resolution
+    duration, input_w, input_h = get_video_info(input_file)
     if duration is None:
         print("Warning: Could not determine video duration, creating single segment...")
         duration = max_duration
+
+    if input_w:
+        print(f"Input resolution: {input_w}x{input_h}")
     
     # Calculate number of segments needed
     num_segments = int(duration / max_duration) + (1 if duration % max_duration > 0 else 0)
@@ -90,6 +100,12 @@ def convert_insv_to_shorts(input_file, output_dir=None, max_duration=120,
     print(f"Segments to create: {num_segments} ({max_duration}s each)")
     print(f"Quality: {quality} (CRF {settings['crf']})")
     print(f"Lens: {lens}")
+    print(f"Yaw: {yaw}°")
+    print(f"FOV: {fov}°")
+
+    # Select video stream based on lens choice
+    # Stream 0 = front lens (screen side), Stream 1 = back lens
+    stream_index = 0 if lens == 'front' else 1
     
     successful_segments = 0
     
@@ -109,33 +125,26 @@ def convert_insv_to_shorts(input_file, output_dir=None, max_duration=120,
         print(f"Duration: {segment_duration:.1f}s")
         print(f"Output: {output_file.name}")
         
-        # Build video filter for Insta360 X4 dual-fisheye format
-        # The X4 has two fisheye lenses side by side in the frame
-        # Front lens is on the left side, back lens is on the right side
-        # We'll crop to one lens and rotate to portrait orientation
-        
-        if lens == 'front':
-            # Crop left half (front lens)
-            # X4 resolution is typically 3840x1920 or 7680x3840 (dual fisheye side-by-side)
-            # Each half is square (1920x1920 or 3840x3840), scale and crop to 9:16 portrait
-            video_filter = (
-                "crop=iw/2:ih:0:0,"  # Crop left half (front lens)
-                "scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920"
-            )
-        else:  # back lens
-            # Crop right half (back lens)
-            video_filter = (
-                "crop=iw/2:ih:iw/2:0,"  # Crop right half (back lens)
-                "scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920"
-            )
+        # Build video filter using v360 fisheye-to-rectilinear reprojection
+        # This produces a proper flat perspective view from the fisheye lens
+        # yaw: horizontal pan (-80 to 80), 0 = straight ahead
+        # h_fov: horizontal field of view, v_fov calculated for 9:16 ratio
+        v_fov = fov * 16 / 9
+        video_filter = (
+            f"v360=fisheye:rectilinear:"
+            f"yaw={yaw}:pitch=0:roll=0:"
+            f"ih_fov=190:iv_fov=190:"
+            f"h_fov={fov}:v_fov={v_fov:.1f}:"
+            f"w=1080:h=1920"
+        )
         
         cmd = [
             'ffmpeg',
             '-ss', str(start_time),  # Start time
             '-i', str(input_file),
             '-t', str(segment_duration),  # Segment duration
+            '-map', f'0:v:{stream_index}',  # Select lens stream
+            '-map', '0:a:0',  # Audio stream
             '-vf', video_filter,
             '-c:v', 'libx264',
             '-crf', settings['crf'],
@@ -168,7 +177,7 @@ def convert_insv_to_shorts(input_file, output_dir=None, max_duration=120,
     return successful_segments
 
 
-def batch_convert(input_dir, output_dir=None, max_duration=120, quality='high', lens='front'):
+def batch_convert(input_dir, output_dir=None, max_duration=120, quality='high', lens='front', yaw=0, fov=80):
     """Convert all .insv files in a directory"""
     input_path = Path(input_dir)
     
@@ -193,7 +202,7 @@ def batch_convert(input_dir, output_dir=None, max_duration=120, quality='high', 
         print(f"Processing file {idx}/{len(insv_files)}")
         print(f"{'='*60}")
         
-        segments = convert_insv_to_shorts(file, output_dir, max_duration, quality, lens)
+        segments = convert_insv_to_shorts(file, output_dir, max_duration, quality, lens, yaw, fov)
         if segments > 0:
             successful_files += 1
             total_segments += segments
@@ -226,9 +235,21 @@ Examples:
   # Medium quality for faster processing
   python insta360_to_shorts.py --lens front -q medium
 
-The Insta360 X4 has two lenses:
-- Front lens: The side with the screen (facing you when shooting)
-- Back lens: The opposite side (facing away from you)
+  # Pan the view to the left
+  python insta360_to_shorts.py --yaw -40
+
+  # Pan the view to the right
+  python insta360_to_shorts.py --yaw 40
+
+  # Zoom in with narrow FOV
+  python insta360_to_shorts.py --fov 50
+
+  # Wide angle view
+  python insta360_to_shorts.py --fov 110
+
+Yaw: Horizontal pan angle in degrees. 0 = straight ahead.
+  Usable range is about -80 to 80 for a single fisheye lens.
+FOV: Horizontal field of view. 30 = very zoomed in, 80 = default, 120 = ultra wide.
         """
     )
     
@@ -241,6 +262,10 @@ The Insta360 X4 has two lenses:
                         default='high', help='Output quality (default: high)')
     parser.add_argument('--lens', choices=['front', 'back'], default='front',
                         help='Which lens to use: front (screen side) or back (default: front)')
+    parser.add_argument('--yaw', type=float, default=0,
+                        help='Horizontal pan angle in degrees (default: 0 = center). Usable range ~-80 to 80 for single lens, beyond that will show black.')
+    parser.add_argument('--fov', type=float, default=80,
+                        help='Horizontal field of view in degrees, 30-120 (default: 80). Lower = zoomed in, higher = wider')
     
     args = parser.parse_args()
     
@@ -253,15 +278,19 @@ The Insta360 X4 has two lenses:
         print("  Windows: Download from https://ffmpeg.org/download.html")
         sys.exit(1)
     
+    yaw = args.yaw
+    # Clamp FOV to reasonable range
+    fov = max(30, min(120, args.fov))
+
     input_path = Path(args.input)
-    
+
     # Determine if input is a directory or file
     if input_path.is_dir():
         # Batch process all .insv files in the directory
-        batch_convert(args.input, args.output, args.duration, args.quality, args.lens)
+        batch_convert(args.input, args.output, args.duration, args.quality, args.lens, yaw, fov)
     elif input_path.is_file() and input_path.suffix.lower() == '.insv':
         # Process single file
-        convert_insv_to_shorts(args.input, args.output, args.duration, args.quality, args.lens)
+        convert_insv_to_shorts(args.input, args.output, args.duration, args.quality, args.lens, yaw, fov)
     else:
         print(f"Error: '{args.input}' is not a valid .insv file or directory")
         sys.exit(1)
