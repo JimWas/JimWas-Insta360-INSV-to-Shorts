@@ -1,0 +1,11 @@
+# Video files
+*.insv
+*.INSV
+*.mp4
+*.MP4
+
+# macOS
+.DS_Store
+
+# Claude
+.claude/
